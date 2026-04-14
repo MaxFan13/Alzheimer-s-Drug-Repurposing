@@ -1,202 +1,263 @@
 #!/usr/bin/env python3
 """
-Alzheimer's Disease Drug Repurposing
-Ranks candidate compounds with the pretrained DRKG TransE model
+Alzheimer's disease drug repurposing using DRKG TransE embeddings.
+Ranks DrugBank compounds by predicted treatment score for AD.
 """
-import pandas as pd
-import numpy as np
-import os
-import urllib.request
-import tarfile
-import torch.nn.functional as fn
 import csv
-from utils import download_and_extract
-download_and_extract()
 
-
-# Alzheimer’s disease drug repurposing via disease–compound relations
-# Ranks candidate compounds with the pretrained DRKG TransE model. For graph storage and Cypher, copy `drkg.tsv` into Neo4j’s import folder and run the scripts in `../neo4j/` (see `drug_repurpose/Readme.md`).
-
-# Populated after entity_map is loaded (next section after download)
-AD_disease_candidates = [
-    "Disease::MESH:D000544",  # Alzheimer disease (MeSH)
-    "Disease::DOID:10652",   # Alzheimer disease (DOID), if present
-]
-AD_disease_list = []  # set in embedding prep cell
-
-
-# We use FDA-approved drugs in Drugbank as candidate drugs. (we exclude drugs with molecule weight < 250) The drug list is in infer\_drug.tsv
-
-
-# Two treatment relations
-treatment = ['Hetionet::CtD::Compound:Disease','GNBR::T::Compound:Disease']
-
-
-# Get pretrained model
-entity_idmap_file = 'embed/entities.tsv'
-relation_idmap_file = 'embed/relations.tsv'
-
-
-# Get embeddings for diseases and drugs
-# Load entities from the embed folder
-entities = pd.read_csv('embed/entities.tsv', sep='\t', names=['name', 'id'])
-
-# Filter for compounds only (DrugBank drugs)
-drugs = entities[entities['name'].str.startswith('Compound::DB')]
-
-# Filter by molecular weight > 250 (as mentioned in notebook)
-# For now, just export all DrugBank compounds
-drugs.to_csv('infer_drug.tsv', sep='\t', header=False, index=False)
-
-
-# Load entity file
-drug_list = []
-with open("infer_drug.tsv", newline='', encoding='utf-8') as csvfile:
-    reader = csv.DictReader(csvfile, delimiter='\t', fieldnames=['drug','ids'])
-    for row_val in reader:
-        drug_list.append(row_val['drug'])
-
-# Get drugname/disease name to entity ID mappings
-entity_map = {}
-entity_id_map = {}
-relation_map = {}
-with open(entity_idmap_file, newline='', encoding='utf-8') as csvfile:
-    reader = csv.DictReader(csvfile, delimiter='\t', fieldnames=['name','id'])
-    for row_val in reader:
-        entity_map[row_val['name']] = int(row_val['id'])
-        entity_id_map[int(row_val['id'])] = row_val['name']
-        
-with open(relation_idmap_file, newline='', encoding='utf-8') as csvfile:
-    reader = csv.DictReader(csvfile, delimiter='\t', fieldnames=['name','id'])
-    for row_val in reader:
-        relation_map[row_val['name']] = int(row_val['id'])
-        
-# handle the ID mapping
-AD_disease_list = [d for d in AD_disease_candidates if d in entity_map]
-missing = set(AD_disease_candidates) - set(AD_disease_list)
-if missing:
-    print("Not found in entities.tsv (skipped):", sorted(missing))
-if not AD_disease_list:
-    raise ValueError("No Alzheimer disease nodes found; search entities.tsv and update AD_disease_candidates.")
-
-drug_ids = []
-disease_ids = []
-for drug in drug_list:
-    drug_ids.append(entity_map[drug])
-    
-for disease in AD_disease_list:
-    disease_ids.append(entity_map[disease])
-
-treatment_rid = [relation_map[treat]  for treat in treatment]
-
-# Load embeddings
+import numpy as np
+import pandas as pd
 import torch as th
-entity_emb = np.load('embed/DRKG_TransE_l2_entity.npy')
-rel_emb = np.load('embed/DRKG_TransE_l2_relation.npy')
+import torch.nn.functional as fn
 
-drug_ids = th.tensor(drug_ids).long()
-disease_ids = th.tensor(disease_ids).long()
-treatment_rid = th.tensor(treatment_rid)
+from utils import download_and_extract
 
-drug_emb = th.tensor(entity_emb[drug_ids])
-treatment_embs = [th.tensor(rel_emb[rid]) for rid in treatment_rid]
+AD_DISEASE_CANDIDATES = [
+    "Disease::MESH:D000544",
+    "Disease::DOID:10652",
+]
+
+TREATMENT_RELATIONS = [
+    "Hetionet::CtD::Compound:Disease",
+    "GNBR::T::Compound:Disease",
+]
+
+GAMMA = 12.0
+TOP_K = 100
 
 
-# Drug Repurposing Based on Edge Score
-# We use following algorithm to calculate the edge score. we use logsigmiod to make all scores < 0. The larger the score is, the stronger the $h$ will have $r$ with $t$.
-# $\mathbf{d} = \gamma - ||\mathbf{h}+\mathbf{r}-\mathbf{t}||_{2}$
-# $\mathbf{score} = \log\left(\frac{1}{1+\exp(\mathbf{-d})}\right)$
+def build_drug_list(entities_path, output_path):
+    """Filter DrugBank compounds from the entity list and write them to a file.
 
-gamma=12.0
+    Args:
+        entities_path: Path to the entities TSV file (name, id columns).
+        output_path: Path where the filtered drug TSV will be written.
+
+    Returns:
+        List of drug entity name strings (e.g. 'Compound::DB00001').
+    """
+    entities = pd.read_csv(entities_path, sep='\t', names=['name', 'id'])
+    drugs = entities[entities['name'].str.startswith('Compound::DB')]
+    drugs.to_csv(output_path, sep='\t', header=False, index=False)
+
+    drug_list = []
+    with open(output_path, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f, delimiter='\t', fieldnames=['drug', 'ids']):
+            drug_list.append(row['drug'])
+    return drug_list
+
+
+def load_entity_maps(entity_file, relation_file):
+    """Load entity and relation name-to-id mappings from TSV files.
+
+    Args:
+        entity_file: Path to entities TSV (name, id columns).
+        relation_file: Path to relations TSV (name, id columns).
+
+    Returns:
+        Tuple of (entity_map, entity_id_map, relation_map) where:
+            entity_map: dict mapping entity name -> integer id.
+            entity_id_map: dict mapping integer id -> entity name.
+            relation_map: dict mapping relation name -> integer id.
+    """
+    entity_map = {}
+    entity_id_map = {}
+    relation_map = {}
+
+    with open(entity_file, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f, delimiter='\t', fieldnames=['name', 'id']):
+            entity_map[row['name']] = int(row['id'])
+            entity_id_map[int(row['id'])] = row['name']
+
+    with open(relation_file, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f, delimiter='\t', fieldnames=['name', 'id']):
+            relation_map[row['name']] = int(row['id'])
+
+    return entity_map, entity_id_map, relation_map
+
+
+def resolve_disease_ids(candidates, entity_map):
+    """Validate disease candidate identifiers against the entity map.
+
+    Prints a warning for any candidates not found and raises if none match.
+
+    Args:
+        candidates: List of disease entity name strings to look up.
+        entity_map: dict mapping entity name -> integer id.
+
+    Returns:
+        List of candidate names that exist in entity_map.
+
+    Raises:
+        ValueError: If none of the candidates are found in entity_map.
+    """
+    found = [d for d in candidates if d in entity_map]
+    missing = set(candidates) - set(found)
+    if missing:
+        print("Not found in entities.tsv (skipped):", sorted(missing))
+    if not found:
+        raise ValueError("No Alzheimer disease nodes found. Update AD_DISEASE_CANDIDATES.")
+    return found
+
+
 def transE_l2(head, rel, tail):
-    score = head + rel - tail
-    return gamma - th.norm(score, p=2, dim=-1)
+    """Compute TransE L2 scores: gamma - ||head + rel - tail||_2.
 
-scores_per_disease = []
-dids = []
-for rid in range(len(treatment_embs)):
-    treatment_emb=treatment_embs[rid]
-    for disease_id in disease_ids:
-        disease_emb = entity_emb[disease_id]
-        score = fn.logsigmoid(transE_l2(drug_emb, treatment_emb, disease_emb))
-        scores_per_disease.append(score)
-        dids.append(drug_ids)
-scores = th.cat(scores_per_disease)
-dids = th.cat(dids)
+    Args:
+        head: Tensor of head entity embeddings.
+        rel: Tensor of relation embeddings.
+        tail: Tensor of tail entity embeddings.
+
+    Returns:
+        Tensor of scalar scores (higher is more plausible).
+    """
+    return GAMMA - th.norm(head + rel - tail, p=2, dim=-1)
 
 
-# sort scores in decending order
-idx = th.flip(th.argsort(scores), dims=[0])
-scores = scores[idx].numpy()
-dids = dids[idx].numpy()
+def score_drugs(drug_emb, drug_ids, treatment_embs, disease_ids, entity_emb):
+    """Score all drugs against each treatment relation and disease using TransE.
+
+    Iterates over every (treatment relation, disease) pair, computes
+    log-sigmoid TransE scores for all drugs, then concatenates and sorts
+    results in descending order.
+
+    Args:
+        drug_emb: Tensor of shape (num_drugs, emb_dim) with drug embeddings.
+        drug_ids: Tensor of integer drug entity ids (length num_drugs).
+        treatment_embs: List of relation embedding tensors (one per treatment relation).
+        disease_ids: List of integer disease entity ids.
+        entity_emb: NumPy array of all entity embeddings indexed by id.
+
+    Returns:
+        Tuple of (scores, dids) as NumPy arrays sorted by descending score.
+    """
+    scores_list = []
+    dids_list = []
+    for treatment_emb in treatment_embs:
+        for disease_id in disease_ids:
+            disease_emb = entity_emb[disease_id]
+            score = fn.logsigmoid(transE_l2(drug_emb, treatment_emb, disease_emb))
+            scores_list.append(score)
+            dids_list.append(drug_ids)
+
+    scores = th.cat(scores_list)
+    dids = th.cat(dids_list)
+    idx = th.flip(th.argsort(scores), dims=[0])
+    return scores[idx].numpy(), dids[idx].numpy()
 
 
-# output proposed treatments
-_, unique_indices = np.unique(dids, return_index=True)
-topk=100
-topk_indices = np.sort(unique_indices)[:topk]
-proposed_dids = dids[topk_indices]
-proposed_scores = scores[topk_indices]
+def get_top_k(scores, dids, k):
+    """Return the top-k unique drugs by first-occurrence rank.
+
+    Because the same drug may be scored multiple times (once per
+    relation/disease pair), this deduplicates by keeping the first
+    (highest-ranked) occurrence of each drug id.
+
+    Args:
+        scores: NumPy array of scores sorted in descending order.
+        dids: NumPy array of drug entity ids parallel to scores.
+        k: Maximum number of unique drugs to return.
+
+    Returns:
+        Tuple of (top_dids, top_scores) NumPy arrays of length <= k.
+    """
+    _, unique_indices = np.unique(dids, return_index=True)
+    top_indices = np.sort(unique_indices)[:k]
+    return dids[top_indices], scores[top_indices]
 
 
-# list the pairs of in form of (drug, treat, disease, score)
-# select top K relevent drugs according the edge score
-for i in range(topk):
-    drug = int(proposed_dids[i])
-    score = proposed_scores[i]
-    
-    print("{}\t{}".format(entity_id_map[drug], score))
+def load_known_drugs(filepath):
+    """Load a TSV of known Alzheimer's drugs into a DrugBank-id keyed dict.
+
+    Args:
+        filepath: Path to TSV with columns (id, drug_name, drug_id).
+
+    Returns:
+        dict mapping DrugBank id string -> drug name string.
+    """
+    known = {}
+    with open(filepath, newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f, delimiter='\t', fieldnames=['id', 'drug_name', 'drug_id']):
+            known[row['drug_id']] = row['drug_name']
+    return known
 
 
-# Check known symptomatic AD drugs (optional sanity check)
-# A short list of common symptomatic therapies (DrugBank IDs) in `alzheimers_known_drugs.tsv`. Overlap with top‑K predictions is informative but not a gold standard—many effective compounds may not be labeled for AD in DRKG.
-known_ad_file = 'alzheimers_known_drugs.tsv'
-known_ad_map = {}
-with open(known_ad_file, newline='', encoding='utf-8') as csvfile:
-    reader = csv.DictReader(csvfile, delimiter='\t', fieldnames=['id', 'drug_name','drug_id'])
-    for row_val in reader:
-        known_ad_map[row_val['drug_id']] = row_val['drug_name']
-        
-for i in range(topk):
-    drug = entity_id_map[int(proposed_dids[i])][10:17]
-    if known_ad_map.get(drug, None) is not None:
-        score = proposed_scores[i]
-        print("[{}]\t{}\t{}".format(i, known_ad_map[drug], score))
+def export_predictions(proposed_dids, proposed_scores, entity_id_map, output_file, topk):
+    """Write the top-k drug predictions to a ranked TSV file.
 
-# Export top 100 predictions to TSV for Neo4j import
-output_file = 'alzheimers_top100_predictions.tsv'
-with open(output_file, 'w', encoding='utf-8') as f:
-    f.write("rank\tdrug_id\tdrug_name\tscore\n")
-    for i in range(topk):
-        drug = int(proposed_dids[i])
-        score = proposed_scores[i]
-        drug_id = entity_id_map[drug]
-        # Extract DrugBank ID (e.g., DB00843 from Compound::DB00843)
-        drug_name = drug_id.split('::')[1] if '::' in drug_id else drug_id
-        f.write(f"{i+1}\t{drug_id}\t{drug_name}\t{score}\n")
+    Args:
+        proposed_dids: Array of top-k drug entity ids.
+        proposed_scores: Array of corresponding scores.
+        entity_id_map: dict mapping integer id -> entity name string.
+        output_file: Path to the output TSV file.
+        topk: Number of predictions to write.
+    """
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("rank\tdrug_id\tdrug_name\tscore\n")
+        for i in range(topk):
+            drug_id = entity_id_map[int(proposed_dids[i])]
+            drug_name = drug_id.split('::')[1] if '::' in drug_id else drug_id
+            f.write(f"{i+1}\t{drug_id}\t{drug_name}\t{proposed_scores[i]}\n")
 
 
-len(known_ad_map)
+def add_drkg_headers(input_file, output_file):
+    """Prepend a header row to the raw DRKG TSV and write to a new file.
 
-"""
-Add headers to drkg.tsv for Neo4j import
-"""
+    Args:
+        input_file: Path to the raw DRKG TSV (no header).
+        output_file: Path where the headered TSV will be written.
+    """
+    with open(input_file, 'r', encoding='utf-8') as infile, \
+         open(output_file, 'w', encoding='utf-8') as outfile:
+        outfile.write("source\trelation\ttarget\n")
+        for line in infile:
+            outfile.write(line)
 
-# Path to your original drkg.tsv file
-output_file = "drkg_with_headers.tsv"
 
-# Header line
-header = "source\trelation\ttarget\n"
+def main():
+    """Orchestrate the full drug repurposing pipeline.
 
-# Write header and copy all lines
-with open("drkg.tsv", 'r', encoding='utf-8') as infile, \
-     open(output_file, 'w', encoding='utf-8') as outfile:
-    
-    # Write header first
-    outfile.write(header)
-    
-    # Copy all lines from original file
-    line_count = 0
-    for line in infile:
-        outfile.write(line)
-        line_count += 1
+    Downloads and extracts DRKG data, scores all DrugBank compounds against
+    Alzheimer's disease nodes using TransE embeddings, prints the top-k
+    results, highlights any known AD drugs in the top-k, and writes
+    predictions to a TSV file.
+    """
+    download_and_extract()
+
+    drug_list = build_drug_list('embed/entities.tsv', 'infer_drug.tsv')
+    entity_map, entity_id_map, relation_map = load_entity_maps(
+        'embed/entities.tsv', 'embed/relations.tsv'
+    )
+
+    disease_list = resolve_disease_ids(AD_DISEASE_CANDIDATES, entity_map)
+
+    drug_ids = th.tensor([entity_map[d] for d in drug_list]).long()
+    disease_ids = [entity_map[d] for d in disease_list]
+    treatment_rid = th.tensor([relation_map[r] for r in TREATMENT_RELATIONS])
+
+    entity_emb = np.load('embed/DRKG_TransE_l2_entity.npy')
+    rel_emb = np.load('embed/DRKG_TransE_l2_relation.npy')
+
+    drug_emb = th.tensor(entity_emb[drug_ids])
+    treatment_embs = [th.tensor(rel_emb[rid]) for rid in treatment_rid]
+
+    scores, dids = score_drugs(drug_emb, drug_ids, treatment_embs, disease_ids, entity_emb)
+    proposed_dids, proposed_scores = get_top_k(scores, dids, TOP_K)
+
+    for i in range(TOP_K):
+        print("{}\t{}".format(entity_id_map[int(proposed_dids[i])], proposed_scores[i]))
+
+    known_ad_map = load_known_drugs('alzheimers_known_drugs.tsv')
+    print("\nKnown AD drugs in top {}:".format(TOP_K))
+    for i in range(TOP_K):
+        drug_db_id = entity_id_map[int(proposed_dids[i])][10:17]
+        if drug_db_id in known_ad_map:
+            print("[{}]\t{}\t{}".format(i, known_ad_map[drug_db_id], proposed_scores[i]))
+
+    export_predictions(proposed_dids, proposed_scores, entity_id_map,
+                       'alzheimers_top100_predictions.tsv', TOP_K)
+    add_drkg_headers('drkg.tsv', 'drkg_with_headers.tsv')
+
+
+if __name__ == '__main__':
+    main()
