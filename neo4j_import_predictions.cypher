@@ -88,3 +88,50 @@ RETURN drug.rank as rank,
        intermediate.drkg_id as mechanism
 ORDER BY rank
 LIMIT 50;
+
+
+// Find drugs that share the most common gene targets
+// (Drugs targeting the same genes likely have similar mechanisms)
+MATCH (drug1:PredictedDrug)-[:SAME_AS]->(:Entity)-[:DRKG_REL]-(gene:Entity {entity_type: 'Gene'})-[:DRKG_REL]-(:Entity)<-[:SAME_AS]-(drug2:PredictedDrug)
+WHERE drug1.rank <= 20 AND drug2.rank <= 20 AND id(drug1) < id(drug2)
+WITH drug1, drug2, count(DISTINCT gene) as shared_genes
+WHERE shared_genes >= 3
+RETURN drug1.drug_name as drug_1,
+       drug1.rank as rank_1,
+       drug2.drug_name as drug_2,
+       drug2.rank as rank_2,
+       shared_genes
+ORDER BY shared_genes DESC
+LIMIT 20;
+
+
+// Find the most important genes (hub genes) for Alzheimer's treatment
+// (Genes connected to many top-ranked drugs)
+MATCH (drug:PredictedDrug)-[:SAME_AS]->(:Entity)-[:DRKG_REL]-(gene:Entity {entity_type: 'Gene'})
+WHERE drug.rank <= 20
+WITH gene, count(DISTINCT drug) as drug_count, collect(drug.drug_name) as drugs
+WHERE drug_count >= 3
+RETURN gene.drkg_id as gene,
+       drug_count as connected_drugs,
+       drugs[0..5] as sample_drugs
+ORDER BY drug_count DESC
+LIMIT 20;
+
+// What types of relationships connect top drugs to Alzheimer's?
+MATCH (drug:PredictedDrug)-[:SAME_AS]->(:Entity)-[r:DRKG_REL]-(disease:Entity {drkg_id: 'Disease::MESH:D000544'})
+WHERE drug.rank <= 20
+WITH r.relation as relation_type, count(*) as frequency, collect(DISTINCT drug.drug_name) as drugs
+RETURN relation_type,
+       frequency,
+       drugs[0..5] as sample_drugs
+ORDER BY frequency DESC;
+
+// Find high-ranked drugs NOT in known AD drug list
+// (These are your most promising novel candidates)
+MATCH (drug:PredictedDrug)
+WHERE drug.rank <= 30
+  AND NOT drug.drug_name IN ['DB00843', 'DB00674', 'DB00989', 'DB01043', 'DB00382']
+RETURN drug.rank as rank,
+       drug.drug_name as novel_candidate,
+       drug.prediction_score as score
+ORDER BY rank;
